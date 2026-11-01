@@ -1,0 +1,1 @@
+"""Semangat Wallpaper application package."""

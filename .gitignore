@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+!.env.example
+.vscode/
+_backup_tema/
+jarvis_local/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
