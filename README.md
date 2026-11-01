@@ -70,7 +70,7 @@ If you install mpv another way, make sure `mpv.exe` is on your `PATH` or install
 Replace `YOUR-USERNAME` with your GitHub username:
 
 ```powershell
-git clone https://github.com/YOUR-USERNAME/ALAKANG.git
+git clone https://github.com/MEBAKHA/ALAKANG.git
 cd ALAKANG
 ```
 
