@@ -185,7 +185,7 @@ def windows_workerw():
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def enum_callback(hwnd, _):
         if user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None):
-            worker = user32.FinhidWindowExW(None, hwnd, "WorkerW", None)
+            worker = user32.FindWindowExW(None, hwnd, "WorkerW", None)
             if worker:
                 found.append(worker)
         return True
