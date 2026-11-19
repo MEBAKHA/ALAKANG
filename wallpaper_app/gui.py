@@ -26,6 +26,10 @@ from .games import GameHub
 from .scroll_detector import HandScrollDetector
 
 
+def video_quality_label(max_height):
+    return "Otomatis (terbaik)" if max_height == "best" else f"Maks. {max_height}p"
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -129,6 +133,39 @@ class App:
             row=0, column=1, sticky="ew", padx=4)
         self.btn(source_actions, "💾 Simpan", self.save_source, BLUE, small=True).grid(
             row=0, column=2, sticky="ew", padx=(4, 0))
+
+        quality_row = tk.Frame(source_card, bg=CARD)
+        quality_row.pack(fill="x", pady=(8, 0))
+        tk.Label(quality_row, text="Resolusi", bg=CARD, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 7))
+        saved_quality = engine.cfg.get("video_quality", "best")
+        if (saved_quality != "best" and
+                (isinstance(saved_quality, bool) or not isinstance(saved_quality, int)
+                 or saved_quality <= 0)):
+            saved_quality = "best"
+            engine.cfg["video_quality"] = saved_quality
+        self.video_quality_var = tk.StringVar(value=video_quality_label(saved_quality))
+        self.video_quality_choices = {
+            video_quality_label(saved_quality): saved_quality,
+        }
+        self._quality_scan_in_progress = False
+        self.video_quality_menu = tk.OptionMenu(
+            quality_row, self.video_quality_var, self.video_quality_var.get())
+        self.video_quality_menu.configure(
+            bg=BG, fg=TEXT, activebackground=BLUE, activeforeground="#ffffff",
+            relief="flat", bd=0, highlightthickness=0, font=("Segoe UI", 9))
+        self.video_quality_menu["menu"].configure(
+            bg=CARD, fg=TEXT, activebackground=BLUE, activeforeground="#ffffff")
+        self.video_quality_menu.pack(side="left", fill="x", expand=True)
+        self.video_quality_refresh_btn = self.btn(
+            quality_row, "↻ Cari", self.refresh_video_qualities, BG, small=True)
+        self.video_quality_refresh_btn.pack(side="left", padx=(6, 0))
+        tk.Label(
+            source_card,
+            text="Pilih resolusi yang tersedia. Resolusi maksimal yang dipilih berlaku "
+                 "untuk video online; opsi otomatis memilih kualitas tertinggi.",
+            bg=CARD, fg=MUTED, font=("Segoe UI", 8), wraplength=400, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
 
         playback_card = self.section(shell, "KONTROL WALLPAPER")
         self.main_btn = self.btn(playback_card, "▶  Nyalakan wallpaper", self.on_toggle,
@@ -316,7 +353,7 @@ class App:
         root.bind_all("<Button-3>", self.on_sticker_context_menu)
         self.listener = self.setup_hotkey()
         self.update_clock()
-        self.root.after(100, self.poll_hand_scroll)
+        self.root.after(33, self.poll_hand_scroll)
         saved_video = engine.cfg.get("sticker_video", "")
         if isinstance(saved_video, str) and saved_video.lower().startswith(("http://", "https://")):
             engine.cfg["sticker_video"] = ""
@@ -500,6 +537,107 @@ class App:
     def save_source(self):
         engine.run_bg(engine._set_source, self.url_var.get())
 
+    def refresh_video_qualities(self):
+        if self._quality_scan_in_progress:
+            return
+        source = self.url_var.get().strip().strip('"')
+        if not source.lower().startswith(("http://", "https://")):
+            engine.say("Masukkan dan simpan URL video online untuk mencari resolusinya.")
+            return
+
+        self._quality_scan_in_progress = True
+        self.video_quality_refresh_btn.config(text="Mencari...", state="disabled")
+        self.video_quality_var.set("Mencari resolusi...")
+
+        def scan():
+            try:
+                from yt_dlp import YoutubeDL
+                from yt_dlp.utils import YoutubeDLError
+            except ImportError as error:
+                self.schedule_video_quality_update(
+                    source, [], f"yt-dlp tidak tersedia: {error}")
+                return
+
+            error_message = None
+            try:
+                with YoutubeDL() as ydl:
+                    info = ydl.extract_info(source, download=False)
+                if not isinstance(info, dict):
+                    raise RuntimeError("Informasi video tidak ditemukan.")
+                formats = info.get("formats") or []
+                entries = info.get("entries")
+                if not formats and entries:
+                    entry = next((item for item in entries if item), {})
+                    formats = entry.get("formats") or []
+                heights = sorted({
+                    height for item in formats
+                    if item.get("vcodec") not in (None, "none")
+                    and isinstance((height := item.get("height")), int)
+                    and height > 0
+                }, reverse=True)
+                if not heights:
+                    raise RuntimeError("Resolusi video tidak ditemukan untuk URL ini.")
+            except (YoutubeDLError, OSError, RuntimeError, ValueError) as error:
+                heights = []
+                error_message = f"Gagal mencari resolusi video: {error}"
+            self.schedule_video_quality_update(source, heights, error_message)
+
+        threading.Thread(target=scan, daemon=True).start()
+
+    def schedule_video_quality_update(self, source, heights, error):
+        try:
+            self.root.after(
+                0, lambda: self.update_video_quality_menu(source, heights, error))
+        except tk.TclError:
+            pass
+
+    def update_video_quality_menu(self, source, heights, error):
+        self._quality_scan_in_progress = False
+        self.video_quality_refresh_btn.config(text="↻ Cari", state="normal")
+        if source != self.url_var.get().strip().strip('"'):
+            self.video_quality_var.set(video_quality_label(
+                engine.cfg.get("video_quality", "best")))
+            return
+        if error:
+            self.video_quality_var.set(video_quality_label(
+                engine.cfg.get("video_quality", "best")))
+            engine.say(error)
+            return
+
+        saved_quality = engine.cfg.get("video_quality", "best")
+        if (saved_quality != "best" and
+                (isinstance(saved_quality, bool) or not isinstance(saved_quality, int)
+                 or saved_quality <= 0)):
+            saved_quality = "best"
+            engine.cfg["video_quality"] = saved_quality
+        if isinstance(saved_quality, int) and not isinstance(saved_quality, bool):
+            heights = sorted(set(heights + [saved_quality]), reverse=True)
+        self.video_quality_choices = {"Otomatis (terbaik)": "best"}
+        self.video_quality_choices.update({
+            video_quality_label(height): height for height in heights
+        })
+        menu = self.video_quality_menu["menu"]
+        menu.delete(0, "end")
+        for label, height in self.video_quality_choices.items():
+            menu.add_command(
+                label=label,
+                command=lambda selected_label=label, selected_height=height:
+                    self.select_video_quality(selected_label, selected_height),
+            )
+        selected_label = video_quality_label(
+            saved_quality if saved_quality in ("best", *heights) else "best")
+        self.video_quality_var.set(selected_label)
+        engine.say("Resolusi video berhasil ditemukan. Pilih batas resolusi sebelum menyalakan wallpaper.")
+
+    def select_video_quality(self, label, max_height):
+        self.video_quality_var.set(label)
+        engine.cfg["video_quality"] = max_height
+        save_config(engine.cfg)
+        if max_height == "best":
+            engine.say("Resolusi otomatis: kualitas terbaik yang tersedia; berlaku saat wallpaper dinyalakan.")
+        else:
+            engine.say(f"Resolusi maksimal {max_height}p disimpan; berlaku saat wallpaper dinyalakan.")
+
     def on_toggle(self):
         if engine.is_running():
             if engine.cfg.get("auto_start"):
@@ -677,7 +815,8 @@ class App:
             pass
         if frame is not None and self._scroll_camera_active:
             preview_width = max(220, min(400, self.canvas.winfo_width() - 80))
-            preview_height = preview_width * 3 // 4
+            frame_height, frame_width = frame.shape[:2]
+            preview_height = max(1, round(preview_width * frame_height / frame_width))
             preview = Image.fromarray(frame).resize(
                 (preview_width, preview_height), Image.Resampling.LANCZOS)
             self.scroll_preview.configure(width=preview_width, height=preview_height)

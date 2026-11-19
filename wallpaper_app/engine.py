@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from .config import LOG, MIN_RESUME_SECONDS, POLL_SECONDS, fmt_time, save_config as write_config, video_key
@@ -25,6 +26,7 @@ action_lock = threading.Lock()
 ipc_probe_lock = threading.Lock()
 external_running = False
 last_ipc_probe = 0.0
+wallpaper_requested = False
 
 
 def configure(config):
@@ -162,17 +164,45 @@ def save_position():
 
 
 def poller():
+    desktop_id = windows_current_desktop_id() if OS == "Windows" else None
+    desktop_switch_pending = False
+    next_position_save = time.monotonic() + POLL_SECONDS
     while True:
-        time.sleep(POLL_SECONDS)
-        if is_running():
-            save_position()
+        time.sleep(0.1 if OS == "Windows" else POLL_SECONDS)
+        if OS == "Windows":
+            current_desktop_id = windows_current_desktop_id()
+            if current_desktop_id is not None:
+                if desktop_id is not None and current_desktop_id != desktop_id:
+                    desktop_switch_pending = True
+                desktop_id = current_desktop_id
+            if not wallpaper_requested:
+                desktop_switch_pending = False
+            elif desktop_switch_pending and proc is not None and proc.poll() is None:
+                if run_bg(_move_wallpaper_to_current_desktop):
+                    desktop_switch_pending = False
+        if time.monotonic() >= next_position_save:
+            if is_running():
+                save_position()
+            next_position_save = time.monotonic() + POLL_SECONDS
+
+
+def windows_current_desktop_id():
+    import winreg
+
+    path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+            desktop_id, _ = winreg.QueryValueEx(key, "CurrentVirtualDesktop")
+    except OSError:
+        return None
+    return desktop_id
 
 
 def windows_workerw():
     import ctypes
     from ctypes import wintypes
 
-    user32 = ctypes.windll.user32
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.FindWindowW.restype = wintypes.HWND
     user32.FindWindowExW.restype = wintypes.HWND
     user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND,
@@ -201,10 +231,246 @@ def windows_refresh_wallpaper():
     ctypes.windll.user32.SystemParametersInfoW(20, 0, None, 2)
 
 
-def build_command(source, volume, start_at=0):
+def windows_move_process_to_workerw(process_id):
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    worker = windows_workerw()
+    if not worker:
+        raise RuntimeError("layer desktop Windows tidak ditemukan.")
+
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.EnumChildWindows.argtypes = [wintypes.HWND, callback_type, wintypes.LPARAM]
+    user32.EnumChildWindows.restype = wintypes.BOOL
+    user32.GetParent.argtypes = [wintypes.HWND]
+    user32.GetParent.restype = wintypes.HWND
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+    user32.SetParent.restype = wintypes.HWND
+    user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetClientRect.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+
+    process_windows = []
+
+    def window_process_id(hwnd):
+        owner_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        return owner_pid.value
+
+    def add_process_window(hwnd):
+        if window_process_id(hwnd) == process_id:
+            process_windows.append(hwnd)
+
+    @callback_type
+    def child_callback(hwnd, _):
+        add_process_window(hwnd)
+        return True
+
+    @callback_type
+    def top_level_callback(hwnd, _):
+        add_process_window(hwnd)
+        user32.EnumChildWindows(hwnd, child_callback, 0)
+        return True
+
+    user32.EnumWindows(top_level_callback, 0)
+    if not process_windows:
+        raise RuntimeError("jendela video mpv tidak ditemukan di layer desktop.")
+
+    video_window = next(
+        (hwnd for hwnd in process_windows
+         if user32.GetParent(hwnd) == worker
+         and user32.GetWindowLongW(hwnd, -16) & 0x40000000),
+        None,
+    )
+    if video_window:
+        return
+    video_window = next(
+        (hwnd for hwnd in process_windows
+         if user32.GetParent(hwnd)
+         and window_process_id(user32.GetParent(hwnd)) != process_id
+         and user32.GetWindowLongW(hwnd, -16) & 0x40000000),
+        None,
+    )
+    if not video_window:
+        raise RuntimeError("jendela video mpv tidak ditemukan di layer desktop.")
+
+    ctypes.set_last_error(0)
+    previous_parent = user32.SetParent(video_window, worker)
+    if not previous_parent and ctypes.get_last_error():
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    rect = wintypes.RECT()
+    if not user32.GetClientRect(worker, ctypes.byref(rect)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not user32.SetWindowPos(
+            video_window, None, 0, 0, rect.right, rect.bottom,
+            0x0004 | 0x0010 | 0x0020):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def windows_pin_process_to_all_desktops(process_id):
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    windows = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.EnumChildWindows.argtypes = [wintypes.HWND, callback_type, wintypes.LPARAM]
+    user32.EnumChildWindows.restype = wintypes.BOOL
+
+    def belongs_to_process(hwnd):
+        owner_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        return owner_pid.value == process_id
+
+    @callback_type
+    def child_callback(hwnd, _):
+        if belongs_to_process(hwnd):
+            windows.append(hwnd)
+        return True
+
+    @callback_type
+    def window_callback(hwnd, _):
+        if belongs_to_process(hwnd):
+            windows.append(hwnd)
+        user32.EnumChildWindows(hwnd, child_callback, 0)
+        return True
+
+    user32.EnumWindows(window_callback, 0)
+    if not windows:
+        raise RuntimeError("jendela mpv tidak ditemukan.")
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_uint32),
+            ("Data2", ctypes.c_uint16),
+            ("Data3", ctypes.c_uint16),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    def guid(value):
+        result = GUID()
+        ctypes.memmove(ctypes.byref(result), uuid.UUID(value).bytes_le, 16)
+        return result
+
+    def method(pointer, index, result_type, *argument_types):
+        table = ctypes.cast(
+            pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        ).contents
+        return ctypes.WINFUNCTYPE(
+            result_type, ctypes.c_void_p, *argument_types
+        )(table[index])
+
+    ole32 = ctypes.WinDLL("ole32")
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoCreateInstance.argtypes = [
+        ctypes.POINTER(GUID), ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ole32.CoCreateInstance.restype = ctypes.c_long
+    initialized = ole32.CoInitializeEx(None, 2)
+    if initialized < 0:
+        raise RuntimeError(f"inisialisasi COM gagal (0x{initialized & 0xFFFFFFFF:08X}).")
+
+    provider = ctypes.c_void_p()
+    collection = ctypes.c_void_p()
+    pinned_apps = ctypes.c_void_p()
+    views = []
+
+    def release(pointer):
+        if pointer.value:
+            method(pointer, 2, wintypes.ULONG)(pointer)
+            pointer.value = None
+
+    def query_service(service, interface):
+        result = ctypes.c_void_p()
+        query = method(provider, 3, ctypes.c_long, ctypes.POINTER(GUID),
+                       ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))
+        status = query(provider, ctypes.byref(service), ctypes.byref(interface),
+                       ctypes.byref(result))
+        if status < 0:
+            raise RuntimeError(f"layanan desktop virtual gagal (0x{status & 0xFFFFFFFF:08X}).")
+        return result
+
+    try:
+        shell = guid("C2F03A33-21F5-47FA-B4BB-156362A2F239")
+        service_provider = guid("6D5140C1-7436-11CE-8034-00AA006009FA")
+        status = ole32.CoCreateInstance(
+            ctypes.byref(shell), None, 4, ctypes.byref(service_provider),
+            ctypes.byref(provider),
+        )
+        if status < 0:
+            raise RuntimeError(f"layanan Windows Shell gagal (0x{status & 0xFFFFFFFF:08X}).")
+
+        view_collection = guid("1841C6D7-4F9D-42C0-AF41-8747538F10E5")
+        pinned_apps_service = guid("B5A399E7-1C87-46B8-88E9-FC5747B171BD")
+        pinned_apps_interface = guid("4CE81583-1E4C-4632-A621-07A53543148F")
+        collection = query_service(view_collection, view_collection)
+        pinned_apps = query_service(pinned_apps_service, pinned_apps_interface)
+
+        get_view = method(
+            collection, 6, ctypes.c_long, wintypes.HWND,
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        is_pinned = method(
+            pinned_apps, 6, ctypes.c_long, ctypes.c_void_p,
+            ctypes.POINTER(wintypes.BOOL),
+        )
+        pin_view = method(pinned_apps, 7, ctypes.c_long, ctypes.c_void_p)
+
+        for hwnd in windows:
+            view = ctypes.c_void_p()
+            status = get_view(collection, hwnd, ctypes.byref(view))
+            if status < 0 or not view.value:
+                continue
+            views.append(view)
+            pinned = wintypes.BOOL()
+            status = is_pinned(pinned_apps, view, ctypes.byref(pinned))
+            if status >= 0 and pinned.value:
+                return
+            status = pin_view(pinned_apps, view)
+            if status >= 0:
+                return
+
+        raise RuntimeError("Windows tidak mengenali jendela mpv sebagai jendela desktop.")
+    finally:
+        for view in views:
+            release(view)
+        release(pinned_apps)
+        release(collection)
+        release(provider)
+        ole32.CoUninitialize()
+
+
+def build_command(source, volume, start_at=0, max_height=None):
     mpv_path = find_mpv()
     if not mpv_path:
         raise RuntimeError("mpv tidak ditemukan. Install: scoop install extras/mpv")
+
+    if max_height is not None and (
+            isinstance(max_height, bool) or not isinstance(max_height, int) or max_height <= 0):
+        raise ValueError("Resolusi maksimal video harus berupa angka positif.")
 
     is_url = source.lower().startswith(("http://", "https://"))
     if not is_url and not Path(source).is_file():
@@ -218,20 +484,22 @@ def build_command(source, volume, start_at=0):
         "--no-osc", "--no-input-default-bindings", "--msg-level=all=error,ffmpeg=no",
         "--hwdec=auto-safe",
         "--framedrop=vo",
-        "--cache=yes", "--demuxer-max-bytes=128MiB", "--demuxer-max-back-bytes=32MiB",
         f"--volume={volume}",
         f"--mute={'yes' if volume == 0 else 'no'}",
         f"--input-ipc-server={IPC_PATH}",
     ]
     if is_url:
+        command.extend((
+            "--cache=yes",
+            "--demuxer-max-bytes=128MiB",
+            "--demuxer-max-back-bytes=32MiB",
+        ))
         command.append("--demuxer-readahead-secs=20")
-        command.append(
-            "--ytdl-format="
-            "bestvideo[height<=1080][fps<=30][vcodec^=avc1]+bestaudio/"
-            "bestvideo[height<=1080][fps<=30][vcodec!*=av01]+bestaudio/"
-            "bestvideo[height<=1080][vcodec!*=av01]+bestaudio/"
-            "best[height<=1080]/best"
+        format_selector = (
+            f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]"
+            if max_height is not None else "bestvideo+bestaudio/best"
         )
+        command.append(f"--ytdl-format={format_selector}")
     if start_at > 0:
         command.append(f"--start={start_at}")
 
@@ -268,11 +536,13 @@ def read_log_tail(count=2):
 
 
 def _start(resume=None):
-    global proc, logf
+    global proc, logf, wallpaper_requested
     if is_running():
+        wallpaper_requested = True
         say("Wallpaper sudah menyala.")
         return
     if not cfg.get("url"):
+        wallpaper_requested = False
         say("Pilih file video atau isi URL video dulu.")
         return
     if resume is None:
@@ -285,6 +555,7 @@ def _start(resume=None):
         cfg["positions"][key] = 0
         write_config(cfg)
 
+    wallpaper_requested = True
     if OS != "Windows":
         try:
             os.remove(IPC_PATH)
@@ -293,14 +564,17 @@ def _start(resume=None):
 
     say("Memuat video...")
     try:
-        command = build_command(cfg["url"], cfg.get("volume", 0), start_at)
+        quality = cfg.get("video_quality", "best")
+        max_height = None if quality == "best" else quality
+        command = build_command(cfg["url"], cfg.get("volume", 0), start_at, max_height)
         logf = open(LOG, "w", encoding="utf-8")
         options = {"stdin": subprocess.DEVNULL, "stdout": logf, "stderr": logf}
         if OS == "Windows":
             options["creationflags"] = 0x08000000
         proc = subprocess.Popen(command, **options)
-    except (RuntimeError, OSError) as error:
+    except (RuntimeError, OSError, ValueError) as error:
         close_log()
+        wallpaper_requested = False
         say(f"Gagal: {error}")
         return
 
@@ -309,17 +583,22 @@ def _start(resume=None):
         code = proc.returncode
         proc = None
         close_log()
+        wallpaper_requested = False
         tail = read_log_tail()
         hint = "" if shutil.which("yt-dlp") else " (yt-dlp tidak ditemukan: scoop install yt-dlp)"
         say(f"mpv langsung berhenti (kode {code}).{hint} {tail}")
         return
 
+    wallpaper_requested = True
     events.put(("quote",))
-    say(f"Menyala, lanjut dari {fmt_time(start_at)}. Semangat!" if start_at else "Menyala dari awal. Semangat!")
+    status = (f"Menyala, lanjut dari {fmt_time(start_at)}. Semangat!"
+              if start_at else "Menyala dari awal. Semangat!")
+    say(status)
 
 
 def _stop():
-    global proc, external_running, last_ipc_probe
+    global proc, external_running, last_ipc_probe, wallpaper_requested
+    wallpaper_requested = False
     if is_running():
         save_position()
         if proc is not None and proc.poll() is None:
@@ -334,12 +613,22 @@ def _stop():
             time.sleep(0.3)
             windows_refresh_wallpaper()
         position = cfg["positions"].get(video_key(cfg["url"]), 0)
-        say(f"Dimatikan. Posisi terakhir tersimpan: {fmt_time(position)}." if position >= MIN_RESUME_SECONDS
-            else "Wallpaper dimatikan.")
+        say(f"Dimatikan. Posisi terakhir tersimpan: {fmt_time(position)}."
+            if position >= MIN_RESUME_SECONDS else "Wallpaper dimatikan.")
     proc = None
     external_running = False
     last_ipc_probe = 0.0
     close_log()
+
+
+def _move_wallpaper_to_current_desktop():
+    current_proc = proc
+    if not wallpaper_requested or current_proc is None or current_proc.poll() is not None:
+        return
+    try:
+        windows_move_process_to_workerw(current_proc.pid)
+    except (OSError, RuntimeError) as error:
+        say(f"Gagal memindahkan wallpaper ke desktop aktif: {error}")
 
 
 def _restart_from_start():
@@ -376,15 +665,21 @@ def _toggle():
 
 def run_bg(function, *args):
     """Jalankan aksi di thread terpisah supaya jendela tidak membeku."""
+    if not action_lock.acquire(blocking=False):
+        return False
+
     def wrapper():
-        if not action_lock.acquire(blocking=False):
-            return
         try:
             function(*args)
         finally:
             action_lock.release()
 
-    threading.Thread(target=wrapper, daemon=True).start()
+    try:
+        threading.Thread(target=wrapper, daemon=True).start()
+    except RuntimeError:
+        action_lock.release()
+        raise
+    return True
 
 
 def apply_volume(value):

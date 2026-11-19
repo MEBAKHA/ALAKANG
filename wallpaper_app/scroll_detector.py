@@ -55,7 +55,11 @@ class HandScrollDetector:
     MAX_WHEEL_DELTA = 54
     LANDMARK_SMOOTHING = 0.68
     VELOCITY_SMOOTHING = 0.52
-    MIN_FRAME_INTERVAL = 1 / 20
+    CAMERA_WIDTH = 640
+    CAMERA_HEIGHT = 480
+    DETECTION_WIDTH = 480
+    DETECTION_HEIGHT = 360
+    MIN_FRAME_INTERVAL = 1 / 24
 
     def __init__(self):
         self.messages = queue.Queue()
@@ -254,8 +258,9 @@ class HandScrollDetector:
                     "Periksa koneksi/izin kamera atau pilih kamera lain."))
                 return
 
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 480)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.CAMERA_WIDTH)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.CAMERA_HEIGHT)
+            camera.set(cv2.CAP_PROP_FPS, 30)
             if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
                 camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             options = vision.HandLandmarkerOptions(
@@ -279,7 +284,6 @@ class HandScrollDetector:
             verification_complete = False
             verification_started = None
             verification_message = None
-            frame_count = 0
             previous_timestamp_ms = -1
             next_detection_time = 0.0
             active_gesture = None
@@ -299,7 +303,21 @@ class HandScrollDetector:
                 next_detection_time = now + self.MIN_FRAME_INTERVAL
 
                 frame = cv2.flip(frame, 1)
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_height, frame_width = frame.shape[:2]
+                scale = min(
+                    1.0,
+                    self.DETECTION_WIDTH / frame_width,
+                    self.DETECTION_HEIGHT / frame_height,
+                )
+                detection_frame = frame
+                if scale < 1.0:
+                    detection_frame = cv2.resize(
+                        frame,
+                        (max(1, int(frame_width * scale)),
+                         max(1, int(frame_height * scale))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                rgb = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2RGB)
                 timestamp_ms = max(int(time.monotonic() * 1000), previous_timestamp_ms + 1)
                 previous_timestamp_ms = timestamp_ms
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -456,9 +474,7 @@ class HandScrollDetector:
                         frame, "Tunjukkan telapak tangan ke kamera", (12, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (230, 237, 242), 2)
 
-                frame_count += 1
-                if frame_count % 3 == 0:
-                    self._send_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                self._send_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         except Exception as error:
             self.messages.put(("error", f"Detector scroll berhenti: {error}"))
         finally:

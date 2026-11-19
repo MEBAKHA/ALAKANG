@@ -39,6 +39,7 @@ def load_config():
     config.setdefault("sticker_x", -1)
     config.setdefault("sticker_y", 90)
     config.setdefault("volume", 0)
+    config.setdefault("video_quality", "best")
     config.setdefault("auto_resume", True)
     config.setdefault("auto_start", False)
     config.setdefault("keep_sticker_on_close", False)

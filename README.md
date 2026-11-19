@@ -15,14 +15,15 @@ Use this text in GitHub's **Description** field:
 ## Features
 
 - **Animated wallpapers:** Play a local video or enter a supported online video URL. Videos loop automatically.
+- **Virtual desktops:** On Windows, ALAKANG moves the running video window to the active desktop without restarting playback.
 - **Resume playback:** Save the last playback position and continue from it.
 - **Windows startup:** Optionally restore the wallpaper when you sign in to Windows. The computer must be on and signed in; a wallpaper cannot keep playing while the laptop is shut down.
 - **Hand controls:** Use a webcam and MediaPipe hand tracking to scroll with an index-finger gesture. Camera frames are processed locally by the app.
 - **Floating desktop extras:** Add a custom image sticker and a Spotify playlist shortcut.
 - **Mini-games:** Play Kucing Dash, a cat-themed obstacle runner, or WEB HERO, a webcam-controlled hand-gesture game.
-- **Performance-minded playback:** Online sources are limited to up to 1080p and 30 FPS, with H.264 preferred when available. Hardware decoding is requested when supported.
+- **Selectable online video quality:** Automatically use the best available quality, or scan a video's available resolutions and set a maximum resolution. Hardware decoding is requested when supported.
 
-Actual playback smoothness depends on your video, internet connection, graphics hardware, and other running apps. Local videos keep their original quality, so large or high-resolution files may need more system resources.
+Actual playback smoothness depends on the video codec, resolution, frame rate, internet connection, graphics hardware, and other running apps. Local videos keep their original quality. High-resolution or demanding codecs may exceed what an older laptop can decode smoothly.
 
 ## Requirements
 
@@ -112,6 +113,8 @@ The current app interface is in Indonesian. English translations are included be
 4. Select **Nyalakan wallpaper** (Start wallpaper).
 5. Use **Lanjutkan** (Resume) to continue from a saved position, or **Mulai dari awal** (Start from beginning) to restart the video.
 
+For an online video, use **Cari** next to **Resolusi** to load the resolutions offered by the source. **Otomatis (terbaik)** selects the highest available quality; choosing a maximum resolution can reduce the decoding load on a lower-powered laptop.
+
 For offline playback, select a video file that is already stored on your computer. An online URL needs an internet connection and may stop working if the source changes or is unavailable.
 
 To restore the wallpaper after Windows sign-in, enable **Nyalakan wallpaper otomatis saat masuk Windows** (Start wallpaper automatically when I sign in to Windows) in Preferences. The video itself stops when the computer shuts down; it can resume only after Windows starts and you sign in.
@@ -127,7 +130,7 @@ The global shortcut **Ctrl+Alt+W** toggles the wallpaper.
 3. Hold an open palm fully in view until verification completes.
 4. Choose the button to enable hand scrolling. Raise your index finger and move it up or down to scroll the page under the mouse pointer. Open your palm to stop scrolling.
 
-The first webcam use downloads a MediaPipe hand-tracking model and caches it on your computer. The app processes webcam frames locally; it does not upload those frames.
+The first webcam use downloads a MediaPipe hand-tracking model and caches it on your computer. The preview requests 640×480 when the camera supports it; hand detection is scaled down to keep processing light. The app processes webcam frames locally; it does not upload those frames.
 
 ### Kucing Dash
 
@@ -139,13 +142,14 @@ Open **WEB HERO**, select a camera, and choose **Verifikasi 2 tangan & mulai** (
 
 ## Performance and video quality
 
-- Online playback is limited to 1080p and 30 FPS, and prefers H.264 when the source provides it.
-- The app requests safe hardware decoding through mpv when your system supports it.
-- Local videos are not automatically reduced in resolution. If a local file stutters, try a lower-resolution or lower-bitrate copy.
+- Online playback defaults to the best available video and audio streams without imposing a resolution or frame-rate cap. Use **Cari** next to **Resolusi** to scan a link and choose a maximum resolution; this helps lower-powered laptops use a smaller available stream without changing the source file.
+- The app requests safe hardware decoding through mpv, which falls back when a compatible hardware decoder is unavailable.
+- Local videos are played without reducing their resolution or frame rate. If the laptop cannot decode a file smoothly, try a lower-resolution or lower-bitrate copy; this does not change the original file.
 - Online playback needs a stable connection. Buffering can still happen if the connection or video host is slow.
+- Hardware decoding and frame dropping can help maintain playback on supported devices, but no player can guarantee blur-free, uninterrupted playback for every codec and laptop. Use a video format the laptop can decode and close other demanding apps if playback stutters.
 - Close other camera applications before using hand controls or WEB HERO if the webcam is unavailable.
 
-These settings are intended to balance quality and system load. They cannot guarantee smooth playback on every computer or with every video.
+The app does not intentionally blur, resize, or re-encode the source video. Online quality is automatic-best by default; a selected maximum resolution only chooses a stream at or below that size. The display may scale video to fit the screen. A laptop cannot play a stream smoothly if it cannot decode that stream fast enough, so choose a lower available resolution when needed.
 
 ## Troubleshooting
 
@@ -173,7 +177,7 @@ Confirm that the file plays in mpv. For online sources, check your connection an
 .\.venv\Scripts\python.exe -m pip install --upgrade yt-dlp
 ```
 
-For local files, try a smaller 1080p/30 FPS copy. Some codecs or high-bitrate videos may be too demanding for a particular computer.
+For local files, try a lower-resolution or lower-bitrate copy if the laptop cannot keep up. For online sources, select a video format supported by the laptop if its best available stream stutters. Some codecs or high-bitrate videos may be too demanding for older hardware.
 
 ### The wallpaper does not return after a restart
 
